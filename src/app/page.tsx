@@ -120,8 +120,9 @@ export default function HomePage() {
       </div>
 
       {/* Footer */}
-      <div className="text-center py-5 border-t border-white/[0.04]">
+      <div className="text-center py-5 border-t border-white/[0.04] flex items-center justify-center gap-4">
         <p className="text-[11px] text-neutral-800 tracking-wide">DIGITALFRAME © 2026</p>
+        <a href="/admin" className="text-[11px] text-neutral-700 underline underline-offset-2">Admin</a>
       </div>
     </div>
   )

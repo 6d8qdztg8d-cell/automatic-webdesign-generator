@@ -125,21 +125,21 @@ export default function AdminPage() {
     if (res.ok) setSites(await res.json())
   }
 
-  async function handleGenerate(e: React.FormEvent) {
-    e.preventDefault()
-    let rawUrl = url.trim()
-    if (!rawUrl || generating) return
+  async function handleGenerate() {
+    if (generating) return
 
-    // Normalize: add https:// if missing
+    let rawUrl = url.trim()
+    if (!rawUrl) {
+      setResult({ step: 'error', message: 'Bitte URL eingeben' })
+      return
+    }
+
     if (!/^https?:\/\//i.test(rawUrl)) rawUrl = 'https://' + rawUrl
     setUrl(rawUrl)
-
     setGenerating(true)
-    setProgress([])
     setResult(null)
     setElapsed(0)
 
-    // Start elapsed timer
     timerRef.current = setInterval(() => setElapsed((s) => s + 1), 1000)
 
     try {
@@ -148,17 +148,16 @@ export default function AdminPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: rawUrl }),
       })
-      const data = await res.json()
+      const data = await res.json() as Record<string, unknown>
       if (!res.ok || data.error) {
-        setResult({ step: 'error', message: data.error ?? 'Unbekannter Fehler' })
+        setResult({ step: 'error', message: String(data.error ?? 'Unbekannter Fehler') })
       } else {
-        setResult({ step: 'done', ...data })
+        setResult({ step: 'done', name: String(data.name ?? ''), message: '', vercelUrl: data.vercelUrl as string | undefined })
         setUrl('')
         loadSites()
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Verbindungsfehler'
-      setResult({ step: 'error', message: msg })
+      setResult({ step: 'error', message: err instanceof Error ? err.message : 'Verbindungsfehler' })
     } finally {
       setGenerating(false)
       if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null }
@@ -208,42 +207,43 @@ export default function AdminPage() {
         {/* GENERATE TAB */}
         {tab === 'generate' && (
           <div className="flex flex-col gap-4">
-            <div className="df-card p-4">
-              <form onSubmit={handleGenerate} className="flex flex-col gap-3">
-                <label className="label">URL der Webseite</label>
-                <input
-                  type="text"
-                  inputMode="url"
-                  value={url}
-                  onChange={(e) => setUrl(e.target.value)}
-                  placeholder="beispiel-bar.ch"
-                  className="df-input text-[16px]"
-                  disabled={generating}
-                  autoCorrect="off"
-                  autoCapitalize="none"
-                  spellCheck={false}
-                />
-                <button
-                  type="submit"
-                  disabled={generating || !url.trim()}
-                  className="df-btn-primary w-full py-4 text-[15px] flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  {generating
-                    ? <>
-                        <span className="w-4 h-4 border-2 border-black/30 border-t-black rounded-full animate-spin inline-block flex-shrink-0" />
-                        <span>Generiert… {elapsed > 0 ? `${elapsed}s` : ''}</span>
-                      </>
-                    : '✦ Webseite generieren'}
-                </button>
-                {generating && (
-                  <p className="text-[11px] text-neutral-600 text-center">
-                    {elapsed < 15 ? 'Webseite wird analysiert…'
-                     : elapsed < 40 ? 'Design wird generiert…'
-                     : elapsed < 70 ? 'GitHub Repo & Vercel Deployment…'
-                     : 'Fast fertig, bitte warten…'}
-                  </p>
-                )}
-              </form>
+            <div className="df-card p-4 flex flex-col gap-3">
+              <label className="label">URL der Webseite</label>
+              <input
+                type="text"
+                inputMode="url"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleGenerate() }}
+                placeholder="beispiel-bar.ch"
+                className="df-input text-[16px]"
+                disabled={generating}
+                autoCorrect="off"
+                autoCapitalize="none"
+                spellCheck={false}
+              />
+              <button
+                type="button"
+                onClick={handleGenerate}
+                disabled={generating}
+                style={{ opacity: generating ? 0.6 : 1 }}
+                className="df-btn-primary w-full py-4 text-[15px] flex items-center justify-center gap-2"
+              >
+                {generating
+                  ? <>
+                      <span className="w-4 h-4 border-2 border-black/30 border-t-black rounded-full animate-spin inline-block flex-shrink-0" />
+                      <span>Generiert… {elapsed > 0 ? `${elapsed}s` : ''}</span>
+                    </>
+                  : '✦ Webseite generieren'}
+              </button>
+              {generating && (
+                <p className="text-[11px] text-neutral-600 text-center">
+                  {elapsed < 15 ? 'Webseite wird analysiert…'
+                   : elapsed < 40 ? 'Design wird generiert…'
+                   : elapsed < 70 ? 'GitHub Repo & Vercel Deployment…'
+                   : 'Fast fertig, bitte warten…'}
+                </p>
+              )}
             </div>
 
             {/* Progress */}
