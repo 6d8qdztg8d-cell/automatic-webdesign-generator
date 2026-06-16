@@ -1,50 +1,81 @@
 const STITCH_URL = 'https://stitch.googleapis.com/mcp'
 
-interface MCPResponse {
-  result?: Record<string, unknown>
-  error?: { message: string }
-}
+type MCPContent = { type: string; text?: string }
+type MCPToolResult = { content?: MCPContent[]; isError?: boolean; structuredContent?: Record<string, unknown> }
 
-async function mcpPost(body: object, sessionId?: string): Promise<{ data: MCPResponse; sessionId: string }> {
-  const reqHeaders: Record<string, string> = {
-    'Content-Type': 'application/json',
-    'X-Goog-Api-Key': process.env.STITCH_API_KEY ?? '',
-  }
-  if (sessionId) reqHeaders['mcp-session-id'] = sessionId
-
+async function callTool(name: string, args: Record<string, unknown>): Promise<MCPToolResult> {
   const res = await fetch(STITCH_URL, {
     method: 'POST',
-    headers: reqHeaders,
-    body: JSON.stringify(body),
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Goog-Api-Key': process.env.STITCH_API_KEY ?? '',
+    },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: Date.now(),
+      method: 'tools/call',
+      params: { name, arguments: args },
+    }),
     signal: AbortSignal.timeout(120_000),
   })
 
-  const newSession = res.headers.get('mcp-session-id') ?? sessionId ?? ''
   if (!res.ok) {
     const text = await res.text()
     throw new Error(`Stitch HTTP ${res.status}: ${text.slice(0, 300)}`)
   }
-  const data = await res.json() as MCPResponse
-  if (data.error) throw new Error(`Stitch error: ${data.error.message}`)
-  return { data, sessionId: newSession }
+
+  const body = await res.json() as { result?: MCPToolResult; error?: { message: string } }
+  if (body.error) throw new Error(`Stitch: ${body.error.message}`)
+  return body.result ?? {}
 }
 
-async function callTool(
-  sessionId: string,
-  toolName: string,
-  args: Record<string, unknown>
-): Promise<{ content?: { type: string; text?: string }[]; output?: string; sessionId: string }> {
-  const resp = await mcpPost(
-    { jsonrpc: '2.0', id: Date.now(), method: 'tools/call', params: { name: toolName, arguments: args } },
-    sessionId
-  )
-  const result = resp.data.result as { content?: { type: string; text?: string }[] } | undefined
-  const content = result?.content ?? []
-  return { content, sessionId: resp.sessionId }
+function textFrom(result: MCPToolResult): string {
+  return (result.content ?? []).filter((c) => c.type === 'text').map((c) => c.text ?? '').join('\n')
 }
 
-function extractText(content: { type: string; text?: string }[]): string {
-  return content.filter((c) => c.type === 'text').map((c) => c.text ?? '').join('\n')
+function parseProjectId(text: string): string | null {
+  // Response is JSON like: {"name":"projects/7104302003247339255","title":"..."}
+  try {
+    const parsed = JSON.parse(text)
+    const name: string = parsed?.name ?? parsed?.structuredContent?.name ?? ''
+    const m = name.match(/projects\/(\d+)/)
+    if (m) return m[1]
+  } catch { /* not JSON */ }
+  // Fallback: extract number from string
+  const m = text.match(/projects\/(\d+)/)
+  return m ? m[1] : null
+}
+
+function parseScreenId(text: string, structuredContent?: Record<string, unknown>): string | null {
+  // Try structured content first
+  if (structuredContent) {
+    const name = structuredContent.name as string | undefined
+    if (name) {
+      const m = name.match(/screens\/([^/]+)/)
+      if (m) return m[1]
+    }
+    const screens = structuredContent.screens as { name?: string }[] | undefined
+    if (screens?.length) {
+      const m = screens[0].name?.match(/screens\/([^/]+)/)
+      if (m) return m[1]
+    }
+  }
+  // Try text content (could be JSON)
+  try {
+    const parsed = JSON.parse(text)
+    const items = parsed?.screens ?? (Array.isArray(parsed) ? parsed : null)
+    if (items?.length) {
+      const m = (items[0].name ?? '').match(/screens\/([^/]+)/)
+      if (m) return m[1]
+    }
+    const name = parsed?.name as string | undefined
+    if (name) {
+      const m = name.match(/screens\/([^/]+)/)
+      if (m) return m[1]
+    }
+  } catch { /* not JSON */ }
+  const m = text.match(/screens\/([a-zA-Z0-9_-]+)/)
+  return m ? m[1] : null
 }
 
 async function sleep(ms: number) {
@@ -54,104 +85,98 @@ async function sleep(ms: number) {
 export async function generateWithStitch(prompt: string, slug: string): Promise<string> {
   if (!process.env.STITCH_API_KEY) throw new Error('STITCH_API_KEY fehlt')
 
-  const projectName = `df-${slug}-${Date.now()}`
+  const projectTitle = `df-${slug}-${Date.now()}`
 
-  // 1. Initialize session
-  const init = await mcpPost({
-    jsonrpc: '2.0', id: 1, method: 'initialize',
-    params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'digitalframe', version: '1.0' } },
-  })
-  let sessionId = init.sessionId
+  // 1. Create project — uses { title }, returns { name: "projects/{id}", ... }
+  const cpResult = await callTool('create_project', { title: projectTitle })
+  if (cpResult.isError) throw new Error(`create_project: ${textFrom(cpResult)}`)
 
-  // 2. Create project
-  const createResp = await callTool(sessionId, 'create_project', { project_name: projectName })
-  sessionId = createResp.sessionId
+  const cpText = textFrom(cpResult)
+  const projectId = parseProjectId(cpText) ?? parseProjectId(JSON.stringify(cpResult.structuredContent))
+  if (!projectId) throw new Error(`Konnte Projekt-ID nicht parsen. Response: ${cpText.slice(0, 200)}`)
 
-  // 3. Set DigitalFrame design system
-  const dsResp = await callTool(sessionId, 'create_design_system', {
-    project_name: projectName,
-    primary_color: '#C8FF00',
-    appearance: 'dark',
-    font_family: 'Inter',
-    shape: 'rounded',
-    design_md: `# DigitalFrame Design System
-Background: #0F0F0E (very dark)
-Accent: #C8FF00 (lime green)
-Cards: rgba(255,255,255,0.04) with 1px border rgba(255,255,255,0.07)
-Border radius: 20px cards, 14px buttons
-Typography: Inter, -apple-system, SF Pro Display
-Mobile-first, max-width 430px`,
-  })
-  sessionId = dsResp.sessionId
-
-  // 4. Generate screen from text (async — Stitch takes 1-3 minutes)
-  const genResp = await callTool(sessionId, 'generate_screen_from_text', {
-    project_name: projectName,
-    prompt,
-  })
-  sessionId = genResp.sessionId
-
-  // Check if we already have output
-  const immediateOutput = extractText(genResp.content ?? [])
-  if (immediateOutput.includes('<!DOCTYPE') || immediateOutput.includes('<html')) {
-    return immediateOutput
+  // 2. Create DigitalFrame design system
+  try {
+    await callTool('create_design_system', {
+      projectId,
+      designSystem: {
+        displayName: 'DigitalFrame Dark',
+        theme: {
+          colorMode: 'DARK',
+          headlineFont: 'INTER',
+          bodyFont: 'INTER',
+          roundness: 'ROUND_TWELVE',
+          customColor: '#C8FF00',
+          overridePrimaryColor: '#C8FF00',
+          overrideNeutralColor: '#0F0F0E',
+        },
+      },
+    })
+  } catch {
+    // Design system is optional — continue anyway
   }
 
-  // 5. Poll get_screen every 25 seconds (up to 10 times = ~4 min)
-  for (let attempt = 0; attempt < 10; attempt++) {
-    await sleep(25_000)
+  // 3. Generate screen from text — uses { projectId, prompt, deviceType, modelId }
+  const genResult = await callTool('generate_screen_from_text', {
+    projectId,
+    prompt,
+    deviceType: 'MOBILE',
+    modelId: 'GEMINI_3_1_PRO',
+  })
 
-    const screensResp = await callTool(sessionId, 'list_screens', { project_name: projectName })
-    sessionId = screensResp.sessionId
-    const screensText = extractText(screensResp.content ?? [])
+  if (genResult.isError) throw new Error(`generate_screen_from_text: ${textFrom(genResult)}`)
 
-    // Try to parse screen ID from list
-    let screenId: string | undefined
-    try {
-      const lines = screensText.split('\n').filter(Boolean)
-      // Look for something that looks like a screen ID
-      const idLine = lines.find((l) => l.match(/screen[_\s-]?id|id:/i))
-      if (idLine) {
-        screenId = idLine.match(/[a-zA-Z0-9_-]{8,}/)?.[0]
-      }
-    } catch { /* ignore */ }
+  const genText = textFrom(genResult)
+
+  // Check for immediate HTML output
+  if (genText.includes('<!DOCTYPE') || genText.includes('<html')) return genText
+
+  // Try to extract screen ID from the immediate response
+  let screenId = parseScreenId(genText, genResult.structuredContent)
+
+  // 4. If no screenId yet, poll list_screens every 20s (up to 12 attempts = 4 min)
+  for (let attempt = 0; attempt < 12; attempt++) {
+    await sleep(20_000)
+
+    if (!screenId) {
+      const lsResult = await callTool('list_screens', { projectId })
+      const lsText = textFrom(lsResult)
+      screenId = parseScreenId(lsText, lsResult.structuredContent)
+    }
 
     if (screenId) {
-      const screenResp = await callTool(sessionId, 'get_screen', {
-        project_name: projectName,
-        screen_id: screenId,
-      })
-      sessionId = screenResp.sessionId
-      const screenText = extractText(screenResp.content ?? [])
-      if (screenText && screenText.length > 100) {
-        return wrapInHTML(screenText, slug)
-      }
-    }
+      const gsResult = await callTool('get_screen', { projectId, screenId })
+      const gsText = textFrom(gsResult)
 
-    // Also check if list_screens already returned the code
-    if (screensText && screensText.length > 500) {
-      return wrapInHTML(screensText, slug)
+      if (gsText.includes('<!DOCTYPE') || gsText.includes('<html')) return gsText
+
+      // Check if it's React/JSX code
+      if (gsText.length > 200) return wrapInHTML(gsText, slug)
+
+      // Check structured content for code
+      const code = (gsResult.structuredContent?.code as string) ?? (gsResult.structuredContent?.html as string) ?? ''
+      if (code.length > 100) return wrapInHTML(code, slug)
     }
   }
 
-  // Fallback: return whatever we got from generate_screen_from_text
-  if (immediateOutput && immediateOutput.length > 100) {
-    return wrapInHTML(immediateOutput, slug)
-  }
+  // Last resort: use whatever the generate call returned
+  if (genText.length > 100) return wrapInHTML(genText, slug)
 
-  throw new Error('Stitch hat keinen Screen generiert nach 10 Versuchen')
+  throw new Error('Stitch hat keinen Screen generiert (Timeout nach 4 Min)')
 }
 
 function wrapInHTML(content: string, slug: string): string {
-  // If already HTML, return as-is
-  if (content.trim().startsWith('<!DOCTYPE') || content.trim().startsWith('<html')) {
-    return content
-  }
-  // If it's React JSX, wrap it in an HTML file with React CDN
-  if (content.includes('import React') || content.includes('export default') || content.includes('const App')) {
+  if (content.trim().startsWith('<!DOCTYPE') || content.trim().startsWith('<html')) return content
+
+  if (
+    content.includes('import React') ||
+    content.includes('export default') ||
+    content.includes('const App =') ||
+    content.includes('function App(')
+  ) {
     const cleanContent = content
-      .replace(/^import.*\n/gm, '')
-      .replace(/^export default /m, 'window.App = ')
+      .replace(/^import\s+.*?from\s+['"].*?['"]\s*;?\s*$/gm, '')
+      .replace(/^export\s+default\s+/m, 'window.__StitchApp = ')
     return `<!DOCTYPE html>
 <html lang="de">
 <head>
@@ -161,18 +186,24 @@ function wrapInHTML(content: string, slug: string): string {
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-<style>*{box-sizing:border-box;-webkit-font-smoothing:antialiased}body{margin:0;background:#0F0F0E;color:#fff;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display',sans-serif}</style>
+<style>
+*{box-sizing:border-box;-webkit-font-smoothing:antialiased}
+body{margin:0;background:#0F0F0E;color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Inter',sans-serif}
+:root{--primary:#C8FF00;--bg:#0F0F0E}
+</style>
 </head>
 <body>
 <div id="root"></div>
 <script type="text/babel">
 ${cleanContent}
-ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App))
+const RootApp = window.__StitchApp || App
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(RootApp))
 </script>
 </body>
 </html>`
   }
-  // Otherwise treat as text/markdown — render as plain page
+
+  // Plain text / markdown fallback
   return `<!DOCTYPE html>
 <html lang="de">
 <head>
@@ -181,16 +212,20 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
 <title>${slug}</title>
 <style>body{background:#0F0F0E;color:#fff;font-family:-apple-system,sans-serif;padding:20px;max-width:430px;margin:0 auto}</style>
 </head>
-<body><pre style="white-space:pre-wrap;word-break:break-word">${content}</pre></body>
+<body><pre style="white-space:pre-wrap;word-break:break-word">${content.replace(/</g, '&lt;')}</pre></body>
 </html>`
 }
 
 export async function listStitchTools(): Promise<string[]> {
-  const init = await mcpPost({
-    jsonrpc: '2.0', id: 1, method: 'initialize',
-    params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'digitalframe', version: '1.0' } },
+  const res = await fetch(STITCH_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Goog-Api-Key': process.env.STITCH_API_KEY ?? '',
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+    signal: AbortSignal.timeout(15_000),
   })
-  const toolsResp = await mcpPost({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, init.sessionId)
-  const result = toolsResp.data.result as { tools?: { name: string; description?: string }[] } | undefined
-  return (result?.tools ?? []).map((t) => `${t.name}: ${t.description ?? ''}`)
+  const body = await res.json() as { result?: { tools?: { name: string; description?: string }[] } }
+  return (body.result?.tools ?? []).map((t) => `${t.name}: ${t.description ?? ''}`)
 }

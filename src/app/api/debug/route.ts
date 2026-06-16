@@ -1,86 +1,87 @@
 import { NextResponse } from 'next/server'
+import fs from 'fs'
 
 const STITCH_URL = 'https://stitch.googleapis.com/mcp'
 
-async function stitch(body: object): Promise<unknown> {
+async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   const res = await fetch(STITCH_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'X-Goog-Api-Key': process.env.STITCH_API_KEY ?? '',
     },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(30_000),
+    body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method: 'tools/call', params: { name, arguments: args } }),
+    signal: AbortSignal.timeout(60_000),
   })
   const text = await res.text()
   try { return JSON.parse(text) } catch { return text }
 }
 
 export async function GET() {
-  const results: Record<string, unknown> = {
+  const r: Record<string, unknown> = {
     STITCH_API_KEY: process.env.STITCH_API_KEY ? '✓' : '✗ FEHLT',
     OPENAI_API_KEY: process.env.OPENAI_API_KEY ? '✓' : '✗ FEHLT',
+    IS_VERCEL: process.env.VERCEL ? 'yes' : 'local',
   }
 
-  // Get full tool schemas
+  // Filesystem test
   try {
-    const toolsResp = await stitch({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }) as {
-      result?: { tools?: { name: string; description?: string; inputSchema?: unknown }[] }
+    fs.writeFileSync('/tmp/df-test.json', '{"ok":true}')
+    fs.unlinkSync('/tmp/df-test.json')
+    r.filesystem = '✓'
+  } catch (e) { r.filesystem = `✗ ${e}` }
+
+  // OpenAI
+  try {
+    const res = await fetch('https://api.openai.com/v1/models', {
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+      signal: AbortSignal.timeout(8000),
+    })
+    r.openai = res.ok ? '✓' : `✗ HTTP ${res.status}`
+  } catch (e) { r.openai = `✗ ${e}` }
+
+  // Stitch: create project with correct args
+  const testTitle = `df-debug-${Date.now()}`
+  let projectId = ''
+  try {
+    const cp = await callTool('create_project', { title: testTitle }) as {
+      result?: { content?: { text?: string }[]; structuredContent?: { name?: string } }
     }
-    const tools = toolsResp?.result?.tools ?? []
+    const raw = JSON.stringify(cp).slice(0, 500)
+    r.create_project_raw = raw
 
-    // Show schema for create_project and generate_screen_from_text
-    const cp = tools.find(t => t.name === 'create_project')
-    const gen = tools.find(t => t.name === 'generate_screen_from_text')
-    const gs = tools.find(t => t.name === 'get_screen')
-    const ls = tools.find(t => t.name === 'list_screens')
-    const ds = tools.find(t => t.name === 'create_design_system')
+    // Parse project ID
+    const text = cp?.result?.content?.map((c) => c.text).join('') ?? ''
+    const sc = cp?.result?.structuredContent
+    const nameField = sc?.name ?? ''
+    const m = (text + nameField).match(/projects\/(\d+)/)
+    if (m) {
+      projectId = m[1]
+      r.project_id = projectId
+    } else {
+      r.project_id = `NOT FOUND in: ${text.slice(0, 200)}`
+    }
+  } catch (e) { r.create_project_error = `${e}` }
 
-    results.schema_create_project = JSON.stringify(cp)
-    results.schema_generate_screen = JSON.stringify(gen)
-    results.schema_get_screen = JSON.stringify(gs)
-    results.schema_list_screens = JSON.stringify(ls)
-    results.schema_create_design_system = JSON.stringify(ds)
-    results.all_tool_names = tools.map(t => t.name).join(', ')
-  } catch (e) {
-    results.tools_error = `✗ ${e instanceof Error ? e.message : e}`
+  // Stitch: generate screen (only if we have a project ID)
+  if (projectId) {
+    try {
+      const gen = await callTool('generate_screen_from_text', {
+        projectId,
+        prompt: 'Dark mobile landing page for a bar. Dark background, lime green accent, Inter font.',
+        deviceType: 'MOBILE',
+        modelId: 'GEMINI_3_1_PRO',
+      }) as { result?: { content?: { text?: string }[]; isError?: boolean } }
+      r.generate_raw = JSON.stringify(gen).slice(0, 800)
+      r.generate_is_error = (gen?.result as { isError?: boolean })?.isError ?? false
+    } catch (e) { r.generate_error = `${e}` }
+
+    // List screens immediately after generate
+    try {
+      const ls = await callTool('list_screens', { projectId }) as unknown
+      r.list_screens_raw = JSON.stringify(ls).slice(0, 500)
+    } catch (e) { r.list_screens_error = `${e}` }
   }
 
-  // Try create_project with different arg names
-  const testProject = `df-test-${Date.now()}`
-
-  // Attempt 1: { name }
-  try {
-    const r1 = await stitch({
-      jsonrpc: '2.0', id: 10, method: 'tools/call',
-      params: { name: 'create_project', arguments: { name: testProject } },
-    })
-    results.create_project_name = JSON.stringify(r1).slice(0, 300)
-  } catch (e) {
-    results.create_project_name = `✗ ${e instanceof Error ? e.message : e}`
-  }
-
-  // Attempt 2: { project_name } (what we tried before)
-  try {
-    const r2 = await stitch({
-      jsonrpc: '2.0', id: 11, method: 'tools/call',
-      params: { name: 'create_project', arguments: { project_name: testProject } },
-    })
-    results.create_project_project_name = JSON.stringify(r2).slice(0, 300)
-  } catch (e) {
-    results.create_project_project_name = `✗ ${e instanceof Error ? e.message : e}`
-  }
-
-  // Attempt 3: { title }
-  try {
-    const r3 = await stitch({
-      jsonrpc: '2.0', id: 12, method: 'tools/call',
-      params: { name: 'create_project', arguments: { title: testProject } },
-    })
-    results.create_project_title = JSON.stringify(r3).slice(0, 300)
-  } catch (e) {
-    results.create_project_title = `✗ ${e instanceof Error ? e.message : e}`
-  }
-
-  return NextResponse.json(results, { headers: { 'Cache-Control': 'no-store' } })
+  return NextResponse.json(r, { headers: { 'Cache-Control': 'no-store' } })
 }
