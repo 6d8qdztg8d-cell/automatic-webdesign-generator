@@ -83,6 +83,79 @@ Erstelle eine vollständige WebsiteAnalysis. Das stitchPrompt-Feld soll ein komp
   return analysis
 }
 
+export async function generateHTMLWithOpenAI(
+  metadata: SiteMetadata,
+  analysis: WebsiteAnalysis
+): Promise<string> {
+  const kc = analysis.keyContent
+  const info: string[] = []
+  if (kc.address) info.push(`Address: ${kc.address}`)
+  if (kc.phone) info.push(`Phone: ${kc.phone}`)
+  if (kc.email) info.push(`Email: ${kc.email}`)
+  if (kc.hours) info.push(`Hours: ${kc.hours}`)
+  if (kc.specialties?.length) info.push(`Specialties: ${kc.specialties.join(', ')}`)
+  if (kc.socialLinks?.length) info.push(`Social: ${kc.socialLinks.join(', ')}`)
+
+  const systemPrompt = `You are an expert frontend developer creating a beautiful, self-contained mobile landing page.
+Output ONLY a complete HTML file starting with <!DOCTYPE html>. No markdown, no code blocks, no explanation.
+The HTML must be fully self-contained (all CSS inline in <style>, no external dependencies).`
+
+  const userPrompt = `Create a stunning mobile landing page for this business:
+
+Business: ${analysis.businessName || metadata.title}
+Type: ${analysis.businessType}
+Description: ${analysis.shortDescription}
+Brand Personality: ${analysis.brandPersonality}
+URL: ${metadata.url}
+${info.length ? '\nKey Info:\n' + info.join('\n') : ''}
+
+REQUIRED DESIGN SYSTEM (follow exactly):
+- Background: #0F0F0E (near black)
+- Accent: #C8FF00 (lime green)
+- Card bg: rgba(255,255,255,0.04), border: 1px solid rgba(255,255,255,0.07)
+- Border radius: 20px cards, 14px buttons, 12px inputs
+- Font: -apple-system, BlinkMacSystemFont, 'Inter', 'SF Pro Display', Helvetica, Arial, sans-serif
+- Text: white primary, rgba(255,255,255,0.5) secondary
+- Max-width: 430px centered, padding: 20px
+- Mobile viewport, safe-area-inset support
+
+PAGE SECTIONS:
+1. <header> — Business initials avatar (40px, lime bg, black text), name, category badge
+2. Hero card — large heading with subtle lime glow, short tagline
+3. Quick action buttons row — CTA buttons (lime primary, dark secondary)
+4. Info cards — grid of cards: Address (with map emoji + Google Maps link), Hours, Phone/Email
+5. About section — styled description card
+6. Social links — if available, pill buttons
+7. Footer — "Powered by DigitalFrame" small text
+
+STYLE REQUIREMENTS:
+- No external fonts, no CDN links, no images
+- Smooth animations: cards fade-in on load (CSS @keyframes)
+- Hover states on buttons and cards
+- Lime glow effect on hero: box-shadow: 0 0 80px rgba(200,255,0,0.1)
+- All links open in _blank with rel="noopener"
+
+Return the complete HTML file only.`
+
+  const response = await getClient().chat.completions.create({
+    model: 'gpt-4o',
+    max_tokens: 4096,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ],
+  })
+
+  let html = response.choices[0].message.content ?? ''
+  // Strip any markdown wrapping just in case
+  html = html.replace(/^```html?\n?/i, '').replace(/\n?```$/i, '').trim()
+  if (!html.startsWith('<!DOCTYPE')) {
+    const idx = html.indexOf('<!DOCTYPE')
+    if (idx > 0) html = html.slice(idx)
+  }
+  return html
+}
+
 function buildFallbackPrompt(metadata: SiteMetadata, analysis: WebsiteAnalysis): string {
   return `Generate a premium mobile landing page for the following business:
 
