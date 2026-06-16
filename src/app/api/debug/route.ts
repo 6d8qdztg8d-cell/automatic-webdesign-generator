@@ -1,27 +1,29 @@
 import { NextResponse } from 'next/server'
-import { listStitchTools } from '@/lib/stitch'
 import fs from 'fs'
 
 const STITCH_URL = 'https://stitch.googleapis.com/mcp'
 
-async function stitchMCP(body: object, sessionId?: string): Promise<{ data: unknown; sessionId: string }> {
-  const headers: Record<string, string> = {
+async function stitchRaw(body: object, sessionId?: string): Promise<{ data: unknown; headers: Record<string, string> }> {
+  const reqHeaders: Record<string, string> = {
     'Content-Type': 'application/json',
     'X-Goog-Api-Key': process.env.STITCH_API_KEY ?? '',
   }
-  if (sessionId) headers['mcp-session-id'] = sessionId
+  if (sessionId) reqHeaders['mcp-session-id'] = sessionId
 
   const res = await fetch(STITCH_URL, {
     method: 'POST',
-    headers,
+    headers: reqHeaders,
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(30_000),
   })
-  const newSession = res.headers.get('mcp-session-id') ?? sessionId ?? ''
+
+  const respHeaders: Record<string, string> = {}
+  res.headers.forEach((v, k) => { respHeaders[k] = v })
+
   const text = await res.text()
   let data: unknown
-  try { data = JSON.parse(text) } catch { data = text }
-  return { data, sessionId: newSession }
+  try { data = JSON.parse(text) } catch { data = text.slice(0, 500) }
+  return { data, headers: respHeaders }
 }
 
 export async function GET() {
@@ -50,72 +52,68 @@ export async function GET() {
     results.openai = `✗ ${e instanceof Error ? e.message : e}`
   }
 
-  // Test Stitch: initialize
+  // Initialize Stitch — capture ALL response headers
   let sessionId = ''
   try {
-    const init = await stitchMCP({
+    const init = await stitchRaw({
       jsonrpc: '2.0', id: 1, method: 'initialize',
       params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'df-debug', version: '1' } },
     })
-    sessionId = init.sessionId
-    results.stitch_init = `✓ session=${sessionId.slice(0, 20)}…`
+    results.stitch_init_headers = JSON.stringify(init.headers)
+    results.stitch_init_body = JSON.stringify(init.data).slice(0, 300)
+
+    // Try every possible session-ID header
+    const h = init.headers
+    sessionId = h['mcp-session-id'] ?? h['x-mcp-session-id'] ?? h['session-id'] ?? ''
+    results.stitch_session = sessionId ? sessionId.slice(0, 30) + '…' : 'NONE — trying without session'
   } catch (e) {
     results.stitch_init = `✗ ${e instanceof Error ? e.message : e}`
   }
 
-  // List tools
-  if (sessionId) {
-    try {
-      const tools = await listStitchTools()
-      results.stitch_tools = tools.length + ' tools: ' + tools.map(t => t.split(':')[0]).join(', ')
-    } catch (e) {
-      results.stitch_tools = `✗ ${e instanceof Error ? e.message : e}`
-    }
+  // List tools (try without session if no session)
+  try {
+    const tools = await stitchRaw(
+      { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
+      sessionId || undefined
+    )
+    const tData = tools.data as { result?: { tools?: { name: string }[] } }
+    const names = (tData?.result?.tools ?? []).map((t) => t.name)
+    results.stitch_tools = names.length ? names.join(', ') : JSON.stringify(tools.data).slice(0, 300)
+  } catch (e) {
+    results.stitch_tools = `✗ ${e instanceof Error ? e.message : e}`
+  }
 
-    // Test create_project
-    const testProject = `df-debug-${Date.now()}`
-    try {
-      const cp = await stitchMCP({
-        jsonrpc: '2.0', id: 2, method: 'tools/call',
-        params: { name: 'create_project', arguments: { project_name: testProject } },
-      }, sessionId)
-      sessionId = cp.sessionId
-      const cpData = cp.data as { result?: { content?: unknown[] } }
-      results.stitch_create_project = JSON.stringify(cpData?.result?.content ?? cpData).slice(0, 500)
-    } catch (e) {
-      results.stitch_create_project = `✗ ${e instanceof Error ? e.message : e}`
-    }
+  // Test create_project
+  const testProject = `df-debug-${Date.now()}`
+  try {
+    const cp = await stitchRaw({
+      jsonrpc: '2.0', id: 3, method: 'tools/call',
+      params: { name: 'create_project', arguments: { project_name: testProject } },
+    }, sessionId || undefined)
 
-    // Test generate_screen_from_text (minimal prompt)
-    try {
-      const gen = await stitchMCP({
-        jsonrpc: '2.0', id: 3, method: 'tools/call',
-        params: {
-          name: 'generate_screen_from_text',
-          arguments: {
-            project_name: testProject,
-            prompt: 'A dark mobile landing page for a bar called "Debug Bar". Dark background, lime accent color.',
-          },
+    const cpSession = cp.headers['mcp-session-id'] ?? cp.headers['x-mcp-session-id'] ?? ''
+    if (cpSession) sessionId = cpSession
+    results.stitch_create_project = JSON.stringify(cp.data).slice(0, 500)
+  } catch (e) {
+    results.stitch_create_project = `✗ ${e instanceof Error ? e.message : e}`
+  }
+
+  // Test generate_screen_from_text
+  try {
+    const gen = await stitchRaw({
+      jsonrpc: '2.0', id: 4, method: 'tools/call',
+      params: {
+        name: 'generate_screen_from_text',
+        arguments: {
+          project_name: testProject,
+          prompt: 'Dark mobile landing page for a bar. Dark bg, lime accent.',
         },
-      }, sessionId)
-      sessionId = gen.sessionId
-      const genData = gen.data as { result?: { content?: unknown[] } }
-      results.stitch_generate = JSON.stringify(genData?.result?.content ?? genData).slice(0, 1000)
-    } catch (e) {
-      results.stitch_generate = `✗ ${e instanceof Error ? e.message : e}`
-    }
+      },
+    }, sessionId || undefined)
 
-    // List screens
-    try {
-      const ls = await stitchMCP({
-        jsonrpc: '2.0', id: 4, method: 'tools/call',
-        params: { name: 'list_screens', arguments: { project_name: testProject } },
-      }, sessionId)
-      const lsData = ls.data as { result?: { content?: unknown[] } }
-      results.stitch_list_screens = JSON.stringify(lsData?.result?.content ?? lsData).slice(0, 500)
-    } catch (e) {
-      results.stitch_list_screens = `✗ ${e instanceof Error ? e.message : e}`
-    }
+    results.stitch_generate = JSON.stringify(gen.data).slice(0, 1000)
+  } catch (e) {
+    results.stitch_generate = `✗ ${e instanceof Error ? e.message : e}`
   }
 
   return NextResponse.json(results, { headers: { 'Cache-Control': 'no-store' } })
