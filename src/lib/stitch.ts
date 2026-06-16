@@ -1,9 +1,17 @@
 const STITCH_URL = 'https://stitch.googleapis.com/mcp'
 
 type MCPContent = { type: string; text?: string }
-type MCPToolResult = { content?: MCPContent[]; isError?: boolean; structuredContent?: Record<string, unknown> }
+type MCPToolResult = {
+  content?: MCPContent[]
+  isError?: boolean
+  structuredContent?: Record<string, unknown>
+}
 
-async function callTool(name: string, args: Record<string, unknown>): Promise<MCPToolResult> {
+async function callTool(
+  name: string,
+  args: Record<string, unknown>,
+  timeoutMs = 30_000
+): Promise<MCPToolResult> {
   const res = await fetch(STITCH_URL, {
     method: 'POST',
     headers: {
@@ -16,7 +24,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<MC
       method: 'tools/call',
       params: { name, arguments: args },
     }),
-    signal: AbortSignal.timeout(120_000),
+    signal: AbortSignal.timeout(timeoutMs),
   })
 
   if (!res.ok) {
@@ -33,53 +41,40 @@ function textFrom(result: MCPToolResult): string {
   return (result.content ?? []).filter((c) => c.type === 'text').map((c) => c.text ?? '').join('\n')
 }
 
-function parseProjectId(text: string): string | null {
-  // Response is JSON like: {"name":"projects/7104302003247339255","title":"..."}
+function parseProjectId(text: string, structured?: Record<string, unknown>): string | null {
+  const nameSrc = (structured?.name as string) ?? text
+  const m = nameSrc.match(/projects\/(\d+)/)
+  if (m) return m[1]
+  // Try parsing JSON text
   try {
-    const parsed = JSON.parse(text)
-    const name: string = parsed?.name ?? parsed?.structuredContent?.name ?? ''
-    const m = name.match(/projects\/(\d+)/)
-    if (m) return m[1]
+    const p = JSON.parse(text) as { name?: string }
+    const m2 = (p?.name ?? '').match(/projects\/(\d+)/)
+    if (m2) return m2[1]
   } catch { /* not JSON */ }
-  // Fallback: extract number from string
-  const m = text.match(/projects\/(\d+)/)
-  return m ? m[1] : null
+  return null
 }
 
-function parseScreenId(text: string, structuredContent?: Record<string, unknown>): string | null {
-  // Try structured content first
-  if (structuredContent) {
-    const name = structuredContent.name as string | undefined
-    if (name) {
-      const m = name.match(/screens\/([^/]+)/)
-      if (m) return m[1]
-    }
-    const screens = structuredContent.screens as { name?: string }[] | undefined
-    if (screens?.length) {
-      const m = screens[0].name?.match(/screens\/([^/]+)/)
-      if (m) return m[1]
-    }
+function extractScreenOutput(result: MCPToolResult): string | null {
+  const text = textFrom(result)
+
+  // Direct HTML
+  if (text.includes('<!DOCTYPE') || text.includes('<html')) return text
+
+  // Code blocks
+  const codeMatch = text.match(/```(?:html|jsx?|tsx?)?\n([\s\S]+?)\n```/)
+  if (codeMatch) return codeMatch[1]
+
+  // Structured content with code/html field
+  const sc = result.structuredContent
+  if (sc) {
+    const code = (sc.code as string) ?? (sc.html as string) ?? (sc.content as string) ?? ''
+    if (code.length > 100) return code
   }
-  // Try text content (could be JSON)
-  try {
-    const parsed = JSON.parse(text)
-    const items = parsed?.screens ?? (Array.isArray(parsed) ? parsed : null)
-    if (items?.length) {
-      const m = (items[0].name ?? '').match(/screens\/([^/]+)/)
-      if (m) return m[1]
-    }
-    const name = parsed?.name as string | undefined
-    if (name) {
-      const m = name.match(/screens\/([^/]+)/)
-      if (m) return m[1]
-    }
-  } catch { /* not JSON */ }
-  const m = text.match(/screens\/([a-zA-Z0-9_-]+)/)
-  return m ? m[1] : null
-}
 
-async function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms))
+  // Any substantial text (might be JSX or description)
+  if (text.length > 200) return text
+
+  return null
 }
 
 export async function generateWithStitch(prompt: string, slug: string): Promise<string> {
@@ -87,15 +82,15 @@ export async function generateWithStitch(prompt: string, slug: string): Promise<
 
   const projectTitle = `df-${slug}-${Date.now()}`
 
-  // 1. Create project — uses { title }, returns { name: "projects/{id}", ... }
-  const cpResult = await callTool('create_project', { title: projectTitle })
-  if (cpResult.isError) throw new Error(`create_project: ${textFrom(cpResult)}`)
+  // 1. Create project — synchronous, fast
+  const cpResult = await callTool('create_project', { title: projectTitle }, 15_000)
+  if (cpResult.isError) throw new Error(`create_project fehlgeschlagen: ${textFrom(cpResult)}`)
 
   const cpText = textFrom(cpResult)
-  const projectId = parseProjectId(cpText) ?? parseProjectId(JSON.stringify(cpResult.structuredContent))
-  if (!projectId) throw new Error(`Konnte Projekt-ID nicht parsen. Response: ${cpText.slice(0, 200)}`)
+  const projectId = parseProjectId(cpText, cpResult.structuredContent)
+  if (!projectId) throw new Error(`Projekt-ID nicht gefunden in: ${cpText.slice(0, 200)}`)
 
-  // 2. Create DigitalFrame design system
+  // 2. Create design system (optional, skip on error)
   try {
     await callTool('create_design_system', {
       projectId,
@@ -108,75 +103,74 @@ export async function generateWithStitch(prompt: string, slug: string): Promise<
           roundness: 'ROUND_TWELVE',
           customColor: '#C8FF00',
           overridePrimaryColor: '#C8FF00',
-          overrideNeutralColor: '#0F0F0E',
         },
       },
-    })
+    }, 20_000)
   } catch {
-    // Design system is optional — continue anyway
+    // Design system is optional
   }
 
-  // 3. Generate screen from text — uses { projectId, prompt, deviceType, modelId }
+  // 3. Generate screen — BLOCKING (Stitch keeps HTTP connection open for 1-3 min)
+  //    We give it 240 seconds (= Vercel max - buffer for other steps)
   const genResult = await callTool('generate_screen_from_text', {
     projectId,
     prompt,
     deviceType: 'MOBILE',
     modelId: 'GEMINI_3_1_PRO',
-  })
+  }, 240_000)
 
   if (genResult.isError) throw new Error(`generate_screen_from_text: ${textFrom(genResult)}`)
 
-  const genText = textFrom(genResult)
+  // 4. Extract output from the synchronous response
+  const output = extractScreenOutput(genResult)
+  if (output) return wrapInHTML(output, slug)
 
-  // Check for immediate HTML output
-  if (genText.includes('<!DOCTYPE') || genText.includes('<html')) return genText
+  // 5. Fallback: try list_screens once (in case result was stored asynchronously)
+  const lsResult = await callTool('list_screens', { projectId }, 15_000)
+  const lsText = textFrom(lsResult)
 
-  // Try to extract screen ID from the immediate response
-  let screenId = parseScreenId(genText, genResult.structuredContent)
+  // Try to parse screen ID
+  const screenIdMatch = lsText.match(/screens\/([a-zA-Z0-9_-]+)/)
+  if (screenIdMatch) {
+    const screenId = screenIdMatch[1]
+    const gsResult = await callTool('get_screen', { projectId, screenId }, 15_000)
+    const gsOutput = extractScreenOutput(gsResult)
+    if (gsOutput) return wrapInHTML(gsOutput, slug)
+  }
 
-  // 4. If no screenId yet, poll list_screens every 20s (up to 12 attempts = 4 min)
-  for (let attempt = 0; attempt < 12; attempt++) {
-    await sleep(20_000)
-
-    if (!screenId) {
-      const lsResult = await callTool('list_screens', { projectId })
-      const lsText = textFrom(lsResult)
-      screenId = parseScreenId(lsText, lsResult.structuredContent)
-    }
-
-    if (screenId) {
-      const gsResult = await callTool('get_screen', { projectId, screenId })
-      const gsText = textFrom(gsResult)
-
-      if (gsText.includes('<!DOCTYPE') || gsText.includes('<html')) return gsText
-
-      // Check if it's React/JSX code
-      if (gsText.length > 200) return wrapInHTML(gsText, slug)
-
-      // Check structured content for code
-      const code = (gsResult.structuredContent?.code as string) ?? (gsResult.structuredContent?.html as string) ?? ''
-      if (code.length > 100) return wrapInHTML(code, slug)
+  // If structuredContent has screens list
+  const sc = lsResult.structuredContent
+  if (sc) {
+    const screens = sc.screens as Array<{ name?: string }> | undefined
+    if (screens?.length) {
+      const m = screens[0].name?.match(/screens\/([a-zA-Z0-9_-]+)/)
+      if (m) {
+        const gsResult = await callTool('get_screen', { projectId, screenId: m[1] }, 15_000)
+        const gsOutput = extractScreenOutput(gsResult)
+        if (gsOutput) return wrapInHTML(gsOutput, slug)
+      }
     }
   }
 
-  // Last resort: use whatever the generate call returned
-  if (genText.length > 100) return wrapInHTML(genText, slug)
-
-  throw new Error('Stitch hat keinen Screen generiert (Timeout nach 4 Min)')
+  throw new Error('Stitch hat keinen verwertbaren Output zurückgegeben')
 }
 
 function wrapInHTML(content: string, slug: string): string {
-  if (content.trim().startsWith('<!DOCTYPE') || content.trim().startsWith('<html')) return content
+  const trimmed = content.trim()
 
+  // Already HTML
+  if (trimmed.startsWith('<!DOCTYPE') || trimmed.startsWith('<html')) return content
+
+  // React / JSX component
   if (
-    content.includes('import React') ||
-    content.includes('export default') ||
-    content.includes('const App =') ||
-    content.includes('function App(')
+    trimmed.includes('export default') ||
+    trimmed.includes('const App =') ||
+    trimmed.includes('function App(') ||
+    trimmed.includes('import React')
   ) {
-    const cleanContent = content
+    const clean = trimmed
       .replace(/^import\s+.*?from\s+['"].*?['"]\s*;?\s*$/gm, '')
-      .replace(/^export\s+default\s+/m, 'window.__StitchApp = ')
+      .replace(/^export\s+default\s+/m, 'window.__App = ')
     return `<!DOCTYPE html>
 <html lang="de">
 <head>
@@ -186,24 +180,19 @@ function wrapInHTML(content: string, slug: string): string {
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-<style>
-*{box-sizing:border-box;-webkit-font-smoothing:antialiased}
-body{margin:0;background:#0F0F0E;color:#fff;font-family:-apple-system,BlinkMacSystemFont,'Inter',sans-serif}
-:root{--primary:#C8FF00;--bg:#0F0F0E}
-</style>
+<style>*{box-sizing:border-box;-webkit-font-smoothing:antialiased}body{margin:0;background:#0F0F0E;color:#fff;font-family:-apple-system,'Inter',sans-serif}:root{--primary:#C8FF00;--bg:#0F0F0E}</style>
 </head>
-<body>
-<div id="root"></div>
+<body><div id="root"></div>
 <script type="text/babel">
-${cleanContent}
-const RootApp = window.__StitchApp || App
-ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(RootApp))
+${clean}
+const _Root = window.__App ?? App
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(_Root))
 </script>
 </body>
 </html>`
   }
 
-  // Plain text / markdown fallback
+  // Fallback: render as pre
   return `<!DOCTYPE html>
 <html lang="de">
 <head>
