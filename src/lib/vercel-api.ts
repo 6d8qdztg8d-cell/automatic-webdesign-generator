@@ -1,6 +1,6 @@
 const VERCEL_API = 'https://api.vercel.com'
 
-function headers() {
+function authHeaders() {
   return {
     Authorization: `Bearer ${process.env.VERCEL_TOKEN}`,
     'Content-Type': 'application/json',
@@ -11,22 +11,24 @@ function teamQuery() {
   return process.env.VERCEL_TEAM_ID ? `?teamId=${process.env.VERCEL_TEAM_ID}` : ''
 }
 
+async function disableProtection(projectName: string): Promise<void> {
+  await fetch(`${VERCEL_API}/v10/projects/${encodeURIComponent(projectName)}${teamQuery()}`, {
+    method: 'PATCH',
+    headers: authHeaders(),
+    body: JSON.stringify({ ssoProtection: null, passwordProtection: null }),
+  })
+}
+
 export async function deployToVercel(slug: string, html: string): Promise<string> {
   const projectName = `generated-site-${slug}`
   const content = Buffer.from(html).toString('base64')
 
   const res = await fetch(`${VERCEL_API}/v13/deployments${teamQuery()}`, {
     method: 'POST',
-    headers: headers(),
+    headers: authHeaders(),
     body: JSON.stringify({
       name: projectName,
-      files: [
-        {
-          file: 'index.html',
-          data: content,
-          encoding: 'base64',
-        },
-      ],
+      files: [{ file: 'index.html', data: content, encoding: 'base64' }],
       projectSettings: {
         framework: null,
         buildCommand: null,
@@ -43,8 +45,17 @@ export async function deployToVercel(slug: string, html: string): Promise<string
     throw new Error(`Vercel: ${JSON.stringify(err)}`)
   }
 
-  const deployment = await res.json()
-  return await waitForDeployment(deployment.id)
+  const deployment = await res.json() as { id: string; projectId?: string; url?: string }
+  const url = await waitForDeployment(deployment.id)
+
+  // Disable SSO / password protection on the generated project
+  try {
+    await disableProtection(projectName)
+  } catch {
+    // Non-fatal — the URL might still work for the team owner
+  }
+
+  return url
 }
 
 async function waitForDeployment(deploymentId: string): Promise<string> {
@@ -56,14 +67,14 @@ async function waitForDeployment(deploymentId: string): Promise<string> {
     })
 
     if (!res.ok) continue
-    const d = await res.json()
+    const d = await res.json() as { readyState?: string; status?: string; url?: string }
 
     if (d.readyState === 'READY' || d.status === 'READY') {
       return `https://${d.url}`
     }
     if (d.readyState === 'ERROR' || d.status === 'ERROR') {
-      throw new Error('Vercel deployment failed')
+      throw new Error('Vercel deployment fehlgeschlagen')
     }
   }
-  throw new Error('Vercel deployment timed out after 2 minutes')
+  throw new Error('Vercel deployment timed out nach 2 Minuten')
 }
