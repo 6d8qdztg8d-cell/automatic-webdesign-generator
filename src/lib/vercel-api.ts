@@ -59,7 +59,7 @@ export async function deployToVercel(slug: string, html: string): Promise<string
 }
 
 async function waitForDeployment(deploymentId: string): Promise<string> {
-  for (let i = 0; i < 40; i++) {
+  for (let i = 0; i < 20; i++) {
     await new Promise((r) => setTimeout(r, 3000))
 
     const res = await fetch(`${VERCEL_API}/v13/deployments/${deploymentId}${teamQuery()}`, {
@@ -76,5 +76,5 @@ async function waitForDeployment(deploymentId: string): Promise<string> {
       throw new Error('Vercel deployment fehlgeschlagen')
     }
   }
-  throw new Error('Vercel deployment timed out nach 2 Minuten')
+  throw new Error('Vercel deployment timed out nach 60 Sekunden')
 }

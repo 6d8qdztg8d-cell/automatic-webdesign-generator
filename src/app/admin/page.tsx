@@ -111,7 +111,9 @@ export default function AdminPage() {
   const [progress, setProgress] = useState<GenerateProgress[]>([])
   const [result, setResult] = useState<GenerateProgress | null>(null)
   const [sites, setSites] = useState<GeneratedSite[]>([])
+  const [elapsed, setElapsed] = useState(0)
   const progressEndRef = useRef<HTMLDivElement>(null)
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   useEffect(() => { loadSites() }, [])
   useEffect(() => {
@@ -125,21 +127,30 @@ export default function AdminPage() {
 
   async function handleGenerate(e: React.FormEvent) {
     e.preventDefault()
-    if (!url.trim() || generating) return
+    let rawUrl = url.trim()
+    if (!rawUrl || generating) return
+
+    // Normalize: add https:// if missing
+    if (!/^https?:\/\//i.test(rawUrl)) rawUrl = 'https://' + rawUrl
+    setUrl(rawUrl)
+
     setGenerating(true)
     setProgress([])
     setResult(null)
+    setElapsed(0)
+
+    // Start elapsed timer
+    timerRef.current = setInterval(() => setElapsed((s) => s + 1), 1000)
 
     try {
       const res = await fetch('/api/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url.trim() }),
+        body: JSON.stringify({ url: rawUrl }),
       })
       const data = await res.json()
       if (!res.ok || data.error) {
-        setProgress([{ step: 'error', message: data.error ?? 'Unbekannter Fehler' }])
-        setResult({ step: 'error', message: data.error ?? 'Fehler' })
+        setResult({ step: 'error', message: data.error ?? 'Unbekannter Fehler' })
       } else {
         setResult({ step: 'done', ...data })
         setUrl('')
@@ -147,10 +158,10 @@ export default function AdminPage() {
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Verbindungsfehler'
-      setProgress([{ step: 'error', message: msg }])
       setResult({ step: 'error', message: msg })
     } finally {
       setGenerating(false)
+      if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null }
     }
   }
 
@@ -201,13 +212,16 @@ export default function AdminPage() {
               <form onSubmit={handleGenerate} className="flex flex-col gap-3">
                 <label className="label">URL der Webseite</label>
                 <input
-                  type="url"
+                  type="text"
+                  inputMode="url"
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
-                  placeholder="https://beispiel-bar.ch"
+                  placeholder="beispiel-bar.ch"
                   className="df-input text-[16px]"
                   disabled={generating}
-                  required
+                  autoCorrect="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
                 />
                 <button
                   type="submit"
@@ -215,9 +229,20 @@ export default function AdminPage() {
                   className="df-btn-primary w-full py-4 text-[15px] flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   {generating
-                    ? <><span className="w-4 h-4 border-2 border-black/30 border-t-black rounded-full animate-spin inline-block" /> Generiert...</>
+                    ? <>
+                        <span className="w-4 h-4 border-2 border-black/30 border-t-black rounded-full animate-spin inline-block flex-shrink-0" />
+                        <span>Generiert… {elapsed > 0 ? `${elapsed}s` : ''}</span>
+                      </>
                     : '✦ Webseite generieren'}
                 </button>
+                {generating && (
+                  <p className="text-[11px] text-neutral-600 text-center">
+                    {elapsed < 15 ? 'Webseite wird analysiert…'
+                     : elapsed < 40 ? 'Design wird generiert…'
+                     : elapsed < 70 ? 'GitHub Repo & Vercel Deployment…'
+                     : 'Fast fertig, bitte warten…'}
+                  </p>
+                )}
               </form>
             </div>
 
