@@ -131,36 +131,24 @@ export default function AdminPage() {
     setResult(null)
 
     try {
-      const response = await fetch('/api/generate', {
+      const res = await fetch('/api/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: url.trim() }),
       })
-
-      const reader = response.body!.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() ?? ''
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          try {
-            const data: GenerateProgress = JSON.parse(line.slice(6))
-            setProgress((prev) => [...prev, data])
-            if (data.step === 'done' || data.step === 'error') {
-              setResult(data)
-              loadSites()
-            }
-          } catch { /* ignore */ }
-        }
+      const data = await res.json()
+      if (!res.ok || data.error) {
+        setProgress([{ step: 'error', message: data.error ?? 'Unbekannter Fehler' }])
+        setResult({ step: 'error', message: data.error ?? 'Fehler' })
+      } else {
+        setResult({ step: 'done', ...data })
+        setUrl('')
+        loadSites()
       }
     } catch (err) {
-      setProgress((prev) => [...prev, { step: 'error', message: err instanceof Error ? err.message : 'Verbindungsfehler' }])
+      const msg = err instanceof Error ? err.message : 'Verbindungsfehler'
+      setProgress([{ step: 'error', message: msg }])
+      setResult({ step: 'error', message: msg })
     } finally {
       setGenerating(false)
     }
@@ -234,37 +222,19 @@ export default function AdminPage() {
             </div>
 
             {/* Progress */}
-            {progress.length > 0 && (
-              <div className="df-card p-4">
-                <p className="label mb-3">Fortschritt</p>
-                <div className="flex flex-col gap-2.5">
-                  {progress.map((p, i) => (
-                    <div key={i} className="flex items-start gap-3">
-                      <span className={`text-[12px] w-4 text-center flex-shrink-0 mt-0.5 font-bold ${
-                        p.step === 'done' || p.step.includes('_done') || p.step === 'scraped' || p.step === 'generated'
-                          ? 'text-[#C8FF00]'
-                          : p.step === 'error' ? 'text-red-400'
-                          : p.step.includes('_warn') ? 'text-yellow-400'
-                          : p.step.includes('_skip') ? 'text-neutral-700'
-                          : 'text-neutral-500'
-                      }`}>
-                        {p.step.includes('_skip') || p.step === 'error' ? STEP_ICON[p.step] ?? '·'
-                          : generating && i === progress.length - 1 ? '·' : STEP_ICON[p.step] ?? '·'}
-                      </span>
-                      <span className={`text-[13px] leading-snug ${p.step === 'error' ? 'text-red-400' : 'text-neutral-300'}`}>
-                        {p.message}
-                      </span>
-                    </div>
-                  ))}
-                  <div ref={progressEndRef} />
-                </div>
-
-                {result?.step === 'done' && (
-                  <div className="mt-4 pt-4 border-t border-white/[0.06] flex flex-col gap-2">
-                    <p className="text-[13px] text-[#C8FF00] font-semibold">✓ Fertig — {result.name}</p>
+            {result && (
+              <div className={`df-card p-4 ${result.step === 'error' ? 'border-red-500/30' : 'border-[#C8FF00]/20'}`}>
+                {result.step === 'error' ? (
+                  <div className="flex flex-col gap-2">
+                    <p className="text-[14px] text-red-400 font-semibold">✕ Fehler</p>
+                    <p className="text-[12px] text-red-400/80 break-words">{result.message}</p>
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-3">
+                    <p className="text-[14px] text-[#C8FF00] font-semibold">✓ {result.name} — fertig!</p>
                     {result.vercelUrl && (
                       <a href={result.vercelUrl} target="_blank" rel="noopener noreferrer"
-                        className="df-btn-primary text-center py-3 text-[14px]">
+                        className="df-btn-primary text-center py-3.5 text-[15px]">
                         Webseite öffnen →
                       </a>
                     )}

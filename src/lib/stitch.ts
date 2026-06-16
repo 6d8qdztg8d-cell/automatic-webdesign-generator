@@ -1,56 +1,79 @@
-import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+const STITCH_URL = 'https://stitch.googleapis.com/mcp'
 
-const STITCH_MCP_URL = 'https://stitch.googleapis.com/mcp'
+function headers() {
+  return {
+    'Content-Type': 'application/json',
+    'X-Goog-Api-Key': process.env.STITCH_API_KEY ?? '',
+  }
+}
 
-export async function generateWithStitch(prompt: string): Promise<string> {
-  const apiKey = process.env.STITCH_API_KEY
-  if (!apiKey) throw new Error('STITCH_API_KEY nicht konfiguriert')
+async function mcpPost(body: object, sessionId?: string): Promise<{ data: Record<string, unknown>; sessionId?: string }> {
+  const reqHeaders: Record<string, string> = { ...headers() }
+  if (sessionId) reqHeaders['mcp-session-id'] = sessionId
 
-  const transport = new StreamableHTTPClientTransport(new URL(STITCH_MCP_URL), {
-    requestInit: {
-      headers: { 'X-Goog-Api-Key': apiKey },
-    },
+  const res = await fetch(STITCH_URL, {
+    method: 'POST',
+    headers: reqHeaders,
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(120_000),
   })
 
-  const client = new Client(
-    { name: 'digitalframe-generator', version: '1.0.0' },
-    { capabilities: {} }
-  )
-
-  await client.connect(transport)
-
-  try {
-    // Discover available Stitch tools
-    const { tools } = await client.listTools()
-
-    // Find a tool for generating UI / web content
-    const generateTool =
-      tools.find((t) => t.name === 'generate_ui') ??
-      tools.find((t) => t.name === 'create_ui') ??
-      tools.find((t) => t.name.includes('generate') || t.name.includes('create'))
-
-    if (!generateTool) {
-      const names = tools.map((t) => t.name).join(', ')
-      throw new Error(`Kein Stitch-Generierungstool gefunden. Verfügbare Tools: ${names}`)
-    }
-
-    const result = await client.callTool({
-      name: generateTool.name,
-      arguments: { prompt },
-    })
-
-    if (!Array.isArray(result.content)) {
-      throw new Error('Stitch: Unerwartetes Response-Format')
-    }
-
-    const textItem = result.content.find((c) => c.type === 'text')
-    if (!textItem || textItem.type !== 'text') {
-      throw new Error('Stitch: Kein HTML in der Antwort')
-    }
-
-    return (textItem.text as string).replace(/^```html\n?/, '').replace(/\n?```$/, '').trim()
-  } finally {
-    await client.close()
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`Stitch HTTP ${res.status}: ${text.slice(0, 300)}`)
   }
+
+  const newSession = res.headers.get('mcp-session-id') ?? undefined
+  const data = await res.json() as Record<string, unknown>
+  return { data, sessionId: newSession ?? sessionId }
+}
+
+export async function generateWithStitch(prompt: string): Promise<string> {
+  if (!process.env.STITCH_API_KEY) throw new Error('STITCH_API_KEY fehlt')
+
+  // 1. Initialize
+  const init = await mcpPost({
+    jsonrpc: '2.0', id: 1, method: 'initialize',
+    params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'digitalframe', version: '1.0' } },
+  })
+  const sessionId = init.sessionId
+
+  // 2. List tools to find the right one
+  const toolsResp = await mcpPost({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, sessionId)
+  const toolsResult = (toolsResp.data as { result?: { tools?: { name: string }[] } }).result
+  const tools: { name: string }[] = toolsResult?.tools ?? []
+
+  if (tools.length === 0) throw new Error('Stitch hat keine Tools zurückgegeben')
+
+  const toolName =
+    tools.find((t) => t.name === 'generate_ui')?.name ??
+    tools.find((t) => t.name === 'create_ui')?.name ??
+    tools.find((t) => t.name.includes('generat') || t.name.includes('creat') || t.name.includes('build'))?.name ??
+    tools[0].name
+
+  // 3. Call the generation tool
+  const callResp = await mcpPost({
+    jsonrpc: '2.0', id: 3, method: 'tools/call',
+    params: { name: toolName, arguments: { prompt } },
+  }, sessionId)
+
+  const callResult = (callResp.data as { result?: { content?: { type: string; text?: string }[] } }).result
+  const content = callResult?.content ?? []
+  const textItem = content.find((c) => c.type === 'text')
+
+  if (!textItem?.text) {
+    throw new Error(`Stitch Tool '${toolName}' hat kein HTML zurückgegeben. Response: ${JSON.stringify(callResp.data).slice(0, 300)}`)
+  }
+
+  return textItem.text.replace(/^```html\n?/, '').replace(/\n?```$/, '').trim()
+}
+
+export async function listStitchTools(): Promise<string[]> {
+  const init = await mcpPost({
+    jsonrpc: '2.0', id: 1, method: 'initialize',
+    params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'digitalframe', version: '1.0' } },
+  })
+  const toolsResp = await mcpPost({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, init.sessionId)
+  const result = (toolsResp.data as { result?: { tools?: { name: string; description?: string }[] } }).result
+  return (result?.tools ?? []).map((t) => `${t.name}: ${t.description ?? ''}`)
 }
