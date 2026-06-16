@@ -87,7 +87,7 @@ export async function generateHTMLWithOpenAI(
   metadata: SiteMetadata,
   analysis: WebsiteAnalysis
 ): Promise<string> {
-  const kc = analysis.keyContent
+  const kc = analysis.keyContent ?? {}
   const info: string[] = []
   if (kc.address) info.push(`Address: ${kc.address}`)
   if (kc.phone) info.push(`Phone: ${kc.phone}`)
