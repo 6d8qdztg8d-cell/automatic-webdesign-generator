@@ -13,13 +13,14 @@ export type GenerationResult = {
 
 export async function generateSiteHTML(
   metadata: SiteMetadata,
-  rawHtml: string
+  rawHtml: string,
+  slug: string
 ): Promise<GenerationResult> {
   // Step 1: OpenAI analysiert die Webseite und erstellt den Stitch-Prompt
   const analysis = await analyzeWebsite(metadata, rawHtml)
 
   // Step 2: Stitch generiert die mobile Seite anhand des Prompts
-  const html = await generateWithStitch(analysis.stitchPrompt)
+  const html = await generateWithStitch(analysis.stitchPrompt, slug)
 
   return {
     html,

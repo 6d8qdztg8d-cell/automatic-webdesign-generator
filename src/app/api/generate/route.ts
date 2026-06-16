@@ -41,7 +41,7 @@ export async function POST(request: NextRequest) {
     updateSite(id, { name: metadata.title, slug })
 
     // 2. OpenAI → Stitch
-    const { html, analysis } = await generateSiteHTML(metadata, rawHtml)
+    const { html, analysis } = await generateSiteHTML(metadata, rawHtml, slug)
 
     // 3. GitHub
     let githubRepoUrl: string | null = null
