@@ -6,6 +6,8 @@ import { createGithubRepo, pushHtmlToRepo } from '@/lib/github'
 import { deployToVercel } from '@/lib/vercel-api'
 import type { GeneratedSite } from '@/types'
 
+export const maxDuration = 300
+
 function slugify(text: string): string {
   return text
     .toLowerCase()
@@ -31,53 +33,44 @@ export async function POST(request: NextRequest) {
       const send = (data: object) => {
         try {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`))
-        } catch {
-          // stream may be closed
-        }
+        } catch { /* stream closed */ }
       }
-
-      const site: GeneratedSite = {
-        id,
-        name: '',
-        originalUrl: url,
-        slug: '',
-        githubRepoUrl: null,
-        vercelUrl: null,
-        createdAt: new Date().toISOString(),
-        status: 'generating',
-      }
-      createSite(site)
-      send({ step: 'start', id, message: 'Gestartet...' })
 
       try {
-        // Step 1: Scrape URL
-        send({ step: 'scraping', message: 'Webseite wird geladen und analysiert...' })
+        // Init DB record
+        const site: GeneratedSite = {
+          id,
+          name: '',
+          originalUrl: url,
+          slug: '',
+          githubRepoUrl: null,
+          vercelUrl: null,
+          createdAt: new Date().toISOString(),
+          status: 'generating',
+        }
+        createSite(site)
+        send({ step: 'start', id, message: 'Gestartet...' })
+
+        // Step 1: Scrape
+        send({ step: 'scraping', message: 'Webseite wird geladen...' })
         const { metadata, rawHtml } = await scrapeUrl(url)
         const rawSlug = slugify(metadata.title) || slugify(metadata.domain)
         const slug = rawSlug || id.slice(0, 8)
-
         updateSite(id, { name: metadata.title, slug })
-        send({ step: 'scraped', message: `"${metadata.title}" — ${rawHtml.length > 0 ? Math.round(rawHtml.length / 1024) + 'kb HTML geladen' : 'Domain erkannt'}` })
+        send({ step: 'scraped', message: `"${metadata.title}" gefunden` })
 
-        // Step 2: OpenAI analysiert + Stitch Prompt erstellen
-        send({ step: 'analyzing', message: 'OpenAI analysiert Webseite und erstellt Design-Prompt...' })
-
-        // Step 3: Stitch generiert Mobile Site
-        send({ step: 'generating', message: 'Stitch generiert mobile Landingpage...' })
-
+        // Step 2: OpenAI analyse + Stitch generiert
+        send({ step: 'analyzing', message: 'OpenAI analysiert Design & Inhalt...' })
+        send({ step: 'generating', message: 'Stitch generiert mobile Seite...' })
         const { html, analysis } = await generateSiteHTML(metadata, rawHtml)
+        send({ step: 'generated', message: `Seite generiert (${Math.round(html.length / 1024)}kb) — ${analysis.businessType}` })
 
-        send({
-          step: 'generated',
-          message: `Mobile Seite generiert (${Math.round(html.length / 1024)}kb) — ${analysis.businessType}, ${analysis.brandPersonality}`,
-        })
-
-        // Step 4: GitHub (optional)
+        // Step 3: GitHub
         let githubRepoUrl: string | null = null
         if (process.env.GITHUB_TOKEN) {
           send({ step: 'github', message: 'GitHub Repository wird erstellt...' })
           try {
-            githubRepoUrl = await createGithubRepo(slug, `Mobile Landingpage für ${metadata.title}`)
+            githubRepoUrl = await createGithubRepo(slug, `Mobile Landingpage: ${metadata.title}`)
             await pushHtmlToRepo(githubRepoUrl, html)
             updateSite(id, { githubRepoUrl })
             send({ step: 'github_done', message: 'GitHub Repository erstellt' })
@@ -85,10 +78,10 @@ export async function POST(request: NextRequest) {
             send({ step: 'github_warn', message: `GitHub: ${e instanceof Error ? e.message : 'Fehler'}` })
           }
         } else {
-          send({ step: 'github_skip', message: 'GitHub übersprungen (kein Token konfiguriert)' })
+          send({ step: 'github_skip', message: 'GitHub übersprungen' })
         }
 
-        // Step 5: Vercel (optional)
+        // Step 4: Vercel
         let vercelUrl: string | null = null
         if (process.env.VERCEL_TOKEN) {
           send({ step: 'vercel', message: 'Wird auf Vercel deployed...' })
@@ -102,21 +95,14 @@ export async function POST(request: NextRequest) {
           }
         } else {
           updateSite(id, { status: 'deployed' })
-          send({ step: 'vercel_skip', message: 'Vercel übersprungen (kein Token konfiguriert)' })
+          send({ step: 'vercel_skip', message: 'Vercel übersprungen' })
         }
 
-        send({
-          step: 'done',
-          id,
-          name: metadata.title,
-          slug,
-          githubRepoUrl,
-          vercelUrl,
-          message: 'Fertig!',
-        })
+        send({ step: 'done', id, name: metadata.title, slug, githubRepoUrl, vercelUrl, message: 'Fertig!' })
+
       } catch (error) {
-        const message = error instanceof Error ? error.message : 'Unbekannter Fehler'
-        updateSite(id, { status: 'failed', error: message })
+        const message = error instanceof Error ? error.message : String(error)
+        try { updateSite(id, { status: 'failed', error: message }) } catch { /* ignore */ }
         send({ step: 'error', message })
       } finally {
         controller.close()
@@ -128,7 +114,7 @@ export async function POST(request: NextRequest) {
     headers: {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
-      Connection: 'keep-alive',
+      'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
     },
   })

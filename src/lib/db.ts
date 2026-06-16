@@ -2,7 +2,10 @@ import fs from 'fs'
 import path from 'path'
 import type { GeneratedSite } from '@/types'
 
-const DB_PATH = path.join(process.cwd(), 'data', 'sites.json')
+// Vercel has a read-only filesystem except /tmp
+const DB_PATH = process.env.VERCEL
+  ? '/tmp/digitalframe-sites.json'
+  : path.join(process.cwd(), 'data', 'sites.json')
 
 function ensureDB() {
   const dir = path.dirname(DB_PATH)
@@ -11,8 +14,12 @@ function ensureDB() {
 }
 
 function readDB(): { sites: GeneratedSite[] } {
-  ensureDB()
-  return JSON.parse(fs.readFileSync(DB_PATH, 'utf-8'))
+  try {
+    ensureDB()
+    return JSON.parse(fs.readFileSync(DB_PATH, 'utf-8'))
+  } catch {
+    return { sites: [] }
+  }
 }
 
 function writeDB(data: { sites: GeneratedSite[] }) {
